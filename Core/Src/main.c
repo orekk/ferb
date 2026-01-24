@@ -18,9 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "usbd_cdc_if.h"
 
 /* USER CODE END Includes */
 
@@ -40,27 +42,32 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
 DFSDM_Channel_HandleTypeDef hdfsdm1_channel0;
+DMA_HandleTypeDef hdma_dfsdm1_flt0;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-#define PCM_N 256
-static int32_t pcm32[PCM_N];  // DFSDM DMA gives 32-bit samples
-volatile int pcm_ready = 0;
+#define SAMPLE_RATE     16000
+#define FRAME_MS        20
+#define FRAME_SAMPLES   (SAMPLE_RATE * FRAME_MS / 1000) // 320
+#define FRAME_BYTES     (FRAME_SAMPLES * 2)
 
-static int32_t pcm_copy[PCM_N];
+static int32_t dfsdm_dma[FRAME_SAMPLES * 2];
+static int16_t pcm_frame[FRAME_SAMPLES];
 
+volatile uint32_t half0_pending = 0;
+volatile uint32_t half1_pending = 0;
 
-
-DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
-
+static int32_t dc = 0;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_DFSDM1_Init(void);
 /* USER CODE BEGIN PFP */
@@ -78,6 +85,9 @@ int _write(int file, char *ptr, int len)
   HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
   return len;
 }
+
+uint32_t frame_count = 0;
+uint32_t last_tick = 0;
 
 
 /* USER CODE END 0 */
@@ -111,24 +121,16 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_DFSDM1_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-
-  setvbuf(stdout, NULL, _IONBF, 0); // disable buffering
-  printf("BOOT\r\n");
-
-  printf("BOOT DFSDM\r\n");
-
-  // Start DFSDM regular conversion with DMA
-  if (HAL_DFSDM_FilterRegularStart_DMA(&hdfsdm1_filter0, pcm32, PCM_N) != HAL_OK) {
-    printf("DFSDM start FAIL\r\n");
-    Error_Handler();
-  }
-  printf("DFSDM started\r\n");
-
-
-
+  HAL_DFSDM_FilterRegularStart_DMA(
+      &hdfsdm1_filter0,
+      dfsdm_dma,
+      FRAME_SAMPLES * 2
+  );
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -138,24 +140,76 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (pcm_ready) {
-	    pcm_ready = 0;
+	  uint32_t do0, do1;
 
-	    memcpy(pcm_copy, pcm32, sizeof(pcm32));
+	  __disable_irq();
+	  do0 = half0_pending; half0_pending = 0;
+	  do1 = half1_pending; half1_pending = 0;
+	  __enable_irq();
 
-	    int32_t mn =  2147483647;
-	    int32_t mx = -2147483648;
+	  if (do0 == 0 && do1 == 0) continue;
 
-	    for (int i = 0; i < PCM_N; i++) {
-	      int32_t s = pcm_copy[i];
-	      if (s < mn) mn = s;
-	      if (s > mx) mx = s;
-	    }
-	    printf("PCM min=%ld max=%ld\r\n", mn, mx);
+	  // Drain in correct time order: half0 then half1
+	  while (do0 || do1) {
+
+	      if (do0) {
+	          int32_t *src = &dfsdm_dma[0];
+	          for (int i = 0; i < FRAME_SAMPLES; i++) {
+
+	              int32_t s = src[i] >> 15;        // DFSDM -> approx int16 range
+
+	              // remove DC (high-pass)
+	              dc += (s - dc) >> 8;
+	              s = s - dc;
+
+	              // OPTIONAL small gain (comment this out if too loud)
+	              s = s << 5;   // gain x2
+
+	              // clip safely
+	              if (s > 32767) s = 32767;
+	              if (s < -32768) s = -32768;
+
+	              pcm_frame[i] = (int16_t)s;
+	          }
+
+	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);
+	          do0--;
+	          frame_count++;
+	      }
+
+	      if (do1) {
+	          int32_t *src = &dfsdm_dma[FRAME_SAMPLES];
+	          for (int i = 0; i < FRAME_SAMPLES; i++) {
+
+	              int32_t s = src[i] >> 15;        // DFSDM -> approx int16 range
+
+	              // remove DC (high-pass)
+	              dc += (s - dc) >> 8;
+	              s = s - dc;
+
+	              // OPTIONAL small gain (comment this out if too loud)
+	              s = s << 5;   // gain x2
+
+	              // clip safely
+	              if (s > 32767) s = 32767;
+	              if (s < -32768) s = -32768;
+
+	              pcm_frame[i] = (int16_t)s;
+	          }
+
+	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);
+	          do1--;
+	          frame_count++;
+	      }
 	  }
 
-
-
+	  // 50 frames/sec check (now correct)
+	  uint32_t now = HAL_GetTick();
+	  if (now - last_tick >= 1000) {
+	      if (frame_count != 50) HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+	      frame_count = 0;
+	      last_tick = now;
+	  }
   }
   /* USER CODE END 3 */
 }
@@ -176,16 +230,23 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSICalibrationValue = 0;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 10;
+  RCC_OscInitStruct.PLL.PLLN = 16;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
@@ -203,10 +264,14 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
+
+  /** Enable MSI Auto calibration
+  */
+  HAL_RCCEx_EnableMSIPLLMode();
 }
 
 /**
@@ -224,10 +289,21 @@ static void MX_DFSDM1_Init(void)
   /* USER CODE BEGIN DFSDM1_Init 1 */
 
   /* USER CODE END DFSDM1_Init 1 */
+  hdfsdm1_filter0.Instance = DFSDM1_Filter0;
+  hdfsdm1_filter0.Init.RegularParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
+  hdfsdm1_filter0.Init.RegularParam.FastMode = DISABLE;
+  hdfsdm1_filter0.Init.RegularParam.DmaMode = ENABLE;
+  hdfsdm1_filter0.Init.FilterParam.SincOrder = DFSDM_FILTER_SINC3_ORDER;
+  hdfsdm1_filter0.Init.FilterParam.Oversampling = 128;
+  hdfsdm1_filter0.Init.FilterParam.IntOversampling = 1;
+  if (HAL_DFSDM_FilterInit(&hdfsdm1_filter0) != HAL_OK)
+  {
+    Error_Handler();
+  }
   hdfsdm1_channel0.Instance = DFSDM1_Channel0;
   hdfsdm1_channel0.Init.OutputClock.Activation = ENABLE;
   hdfsdm1_channel0.Init.OutputClock.Selection = DFSDM_CHANNEL_OUTPUT_CLOCK_SYSTEM;
-  hdfsdm1_channel0.Init.OutputClock.Divider = 2;
+  hdfsdm1_channel0.Init.OutputClock.Divider = 39;
   hdfsdm1_channel0.Init.Input.Multiplexer = DFSDM_CHANNEL_EXTERNAL_INPUTS;
   hdfsdm1_channel0.Init.Input.DataPacking = DFSDM_CHANNEL_STANDARD_MODE;
   hdfsdm1_channel0.Init.Input.Pins = DFSDM_CHANNEL_SAME_CHANNEL_PINS;
@@ -241,42 +317,16 @@ static void MX_DFSDM1_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_DFSDM_FilterConfigRegChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_0, DFSDM_CONTINUOUS_CONV_ON) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN DFSDM1_Init 2 */
-  // FILTER 0 (PCM output)
-  hdfsdm1_filter0.Instance = DFSDM1_Filter0;
-  hdfsdm1_filter0.Init.RegularParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
-  hdfsdm1_filter0.Init.RegularParam.FastMode = DISABLE;
-  hdfsdm1_filter0.Init.RegularParam.DmaMode = ENABLE;
-
-  hdfsdm1_filter0.Init.InjectedParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
-  hdfsdm1_filter0.Init.InjectedParam.ScanMode = DISABLE;
-  hdfsdm1_filter0.Init.InjectedParam.DmaMode = DISABLE;
-  hdfsdm1_filter0.Init.InjectedParam.ExtTrigger = DFSDM_FILTER_EXT_TRIG_TIM1_TRGO;
-  hdfsdm1_filter0.Init.InjectedParam.ExtTriggerEdge = DFSDM_FILTER_EXT_TRIG_RISING_EDGE;
-
-  hdfsdm1_filter0.Init.FilterParam.SincOrder = DFSDM_FILTER_SINC3_ORDER;
-  hdfsdm1_filter0.Init.FilterParam.Oversampling = 64;      // start here
-  hdfsdm1_filter0.Init.FilterParam.IntOversampling = 1;
-
-  if (HAL_DFSDM_FilterInit(&hdfsdm1_filter0) != HAL_OK) {
-    Error_Handler();
-  }
-
-  // Link filter0 regular conversion to channel0
-  if (HAL_DFSDM_FilterConfigRegChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_0, DFSDM_CONTINUOUS_CONV_ON) != HAL_OK) {
-    Error_Handler();
-  }
 
 
   /* USER CODE END DFSDM1_Init 2 */
 
 }
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
 
 /**
   * @brief USART2 Initialization Function
@@ -294,7 +344,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 460800;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -310,6 +360,22 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
 
 }
 
@@ -353,13 +419,16 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
 void HAL_DFSDM_FilterRegConvHalfCpltCallback(DFSDM_Filter_HandleTypeDef *hfilter)
 {
-  if (hfilter->Instance == DFSDM1_Filter0) {
-    pcm_ready = 1; // treat half as “ready” too for now
-  }
+    if (hfilter->Instance == DFSDM1_Filter0) half0_pending++;
 }
 
+void HAL_DFSDM_FilterRegConvCpltCallback(DFSDM_Filter_HandleTypeDef *hfilter)
+{
+    if (hfilter->Instance == DFSDM1_Filter0) half1_pending++;
+}
 
 
 /* USER CODE END 4 */
