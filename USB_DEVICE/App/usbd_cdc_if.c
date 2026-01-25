@@ -94,7 +94,7 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
-
+volatile uint8_t usb_tx_busy = 0;
 /* USER CODE END PRIVATE_VARIABLES */
 
 /**
@@ -311,6 +311,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  usb_tx_busy = 0;
   /* USER CODE END 13 */
   return result;
 }

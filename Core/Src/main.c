@@ -55,12 +55,17 @@ UART_HandleTypeDef huart2;
 #define FRAME_BYTES     (FRAME_SAMPLES * 2)
 
 static int32_t dfsdm_dma[FRAME_SAMPLES * 2];
-static int16_t pcm_frame[FRAME_SAMPLES];
 
 volatile uint32_t half0_pending = 0;
 volatile uint32_t half1_pending = 0;
 
 static int32_t dc = 0;
+
+// USB audio double-buffer (so USB can transmit while we fill next frame)
+static int16_t pcm_frame_a[FRAME_SAMPLES];
+static int16_t pcm_frame_b[FRAME_SAMPLES];
+extern volatile uint8_t usb_tx_busy;
+static uint8_t pcm_buf_sel = 0; // 0 -> a, 1 -> b
 
 /* USER CODE END PV */
 
@@ -154,6 +159,8 @@ int main(void)
 
 	      if (do0) {
 	          int32_t *src = &dfsdm_dma[0];
+	          int16_t *out = (pcm_buf_sel == 0) ? pcm_frame_a : pcm_frame_b;
+
 	          for (int i = 0; i < FRAME_SAMPLES; i++) {
 
 	              int32_t s = src[i] >> 15;        // DFSDM -> approx int16 range
@@ -169,16 +176,27 @@ int main(void)
 	              if (s > 32767) s = 32767;
 	              if (s < -32768) s = -32768;
 
-	              pcm_frame[i] = (int16_t)s;
+	              out[i] = (int16_t)s;
 	          }
 
-	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);
+//	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
+
+	          // Stream RAW PCM over USB CDC (non-blocking; drops frame if BUSY)
+	          if (!usb_tx_busy) {
+	        	    if (CDC_Transmit_FS((uint8_t*)out, FRAME_BYTES) == USBD_OK) {
+	        	        usb_tx_busy = 1;      // only mark busy if TX actually started
+	        	        pcm_buf_sel ^= 1;     // flip buffer only if TX started
+	        	    }
+	          }
+
 	          do0--;
 	          frame_count++;
 	      }
 
 	      if (do1) {
 	          int32_t *src = &dfsdm_dma[FRAME_SAMPLES];
+	          int16_t *out = (pcm_buf_sel == 0) ? pcm_frame_a : pcm_frame_b;
+
 	          for (int i = 0; i < FRAME_SAMPLES; i++) {
 
 	              int32_t s = src[i] >> 15;        // DFSDM -> approx int16 range
@@ -194,10 +212,18 @@ int main(void)
 	              if (s > 32767) s = 32767;
 	              if (s < -32768) s = -32768;
 
-	              pcm_frame[i] = (int16_t)s;
+	              out[i] = (int16_t)s;
 	          }
 
-	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);
+//	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
+
+	          if (!usb_tx_busy) {
+	        	    if (CDC_Transmit_FS((uint8_t*)out, FRAME_BYTES) == USBD_OK) {
+	        	        usb_tx_busy = 1;      // only mark busy if TX actually started
+	        	        pcm_buf_sel ^= 1;     // flip buffer only if TX started
+	        	    }
+	          }
+
 	          do1--;
 	          frame_count++;
 	      }
