@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ../Core/Src/main.c:88:5:_write	24	static
 ../Core/Src/main.c:104:5:main	56	static,ignoring_inline_asm
 ../Core/Src/main.c:247:6:SystemClock_Config	96	static
@@ -8,3 +9,18 @@
 ../Core/Src/main.c:449:6:HAL_DFSDM_FilterRegConvHalfCpltCallback	16	static
 ../Core/Src/main.c:454:6:HAL_DFSDM_FilterRegConvCpltCallback	16	static
 ../Core/Src/main.c:466:6:Error_Handler	4	static,ignoring_inline_asm
+=======
+../Core/Src/main.c:102:20:pcm_q_push	16	static,ignoring_inline_asm
+../Core/Src/main.c:114:19:pcm_q_pop	24	static,ignoring_inline_asm
+../Core/Src/main.c:128:20:usb_pump	16	static
+../Core/Src/main.c:139:5:_write	24	static
+../Core/Src/main.c:154:5:main	56	static,ignoring_inline_asm
+../Core/Src/main.c:303:6:SystemClock_Config	96	static
+../Core/Src/main.c:364:13:MX_DFSDM1_Init	8	static
+../Core/Src/main.c:418:13:MX_USART2_UART_Init	8	static
+../Core/Src/main.c:451:13:MX_DMA_Init	16	static
+../Core/Src/main.c:469:13:MX_GPIO_Init	48	static
+../Core/Src/main.c:505:6:HAL_DFSDM_FilterRegConvHalfCpltCallback	16	static
+../Core/Src/main.c:510:6:HAL_DFSDM_FilterRegConvCpltCallback	16	static
+../Core/Src/main.c:522:6:Error_Handler	4	static,ignoring_inline_asm
+>>>>>>> 24dc501 (Sending Audio via USB to Pi5)

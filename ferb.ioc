@@ -2,7 +2,7 @@
 CAD.formats=
 CAD.pinconfig=
 CAD.provider=
-DFSDM1.Divider=39
+DFSDM1.Divider=5
 DFSDM1.DmaMode_reg_FIL0=ENABLE
 DFSDM1.Filter_regChannel_FIL0=DFSDM_CHANNEL_0
 DFSDM1.Fosr_FIL0=128
@@ -160,7 +160,7 @@ ProjectManager.ToolChainLocation=
 ProjectManager.UAScriptAfterPath=
 ProjectManager.UAScriptBeforePath=
 ProjectManager.UnderRoot=true
-ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_USART2_UART_Init-USART2-false-HAL-true,5-MX_DFSDM1_Init-DFSDM1-false-HAL-true
+ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_USART2_UART_Init-USART2-false-HAL-true,5-MX_DFSDM1_Init-DFSDM1-false-HAL-true,6-MX_USB_DEVICE_Init-USB_DEVICE-false-HAL-false
 RCC.ADCFreq_Value=48000000
 RCC.AHBFreq_Value=32000000
 RCC.APB1Freq_Value=32000000

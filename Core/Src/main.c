@@ -61,11 +61,32 @@ volatile uint32_t half1_pending = 0;
 
 static int32_t dc = 0;
 
+<<<<<<< HEAD
 // USB audio double-buffer (so USB can transmit while we fill next frame)
 static int16_t pcm_frame_a[FRAME_SAMPLES];
 static int16_t pcm_frame_b[FRAME_SAMPLES];
 extern volatile uint8_t usb_tx_busy;
 static uint8_t pcm_buf_sel = 0; // 0 -> a, 1 -> b
+=======
+//// USB audio double-buffer (so USB can transmit while we fill next frame)
+//static int16_t pcm_frame_a[FRAME_SAMPLES];
+//static int16_t pcm_frame_b[FRAME_SAMPLES];
+//extern volatile uint8_t usb_tx_busy;
+//static uint8_t pcm_buf_sel = 0; // 0 -> a, 1 -> b
+
+extern volatile uint8_t usb_tx_busy;
+
+/* ---- NEW: small PCM frame queue (ring buffer) ---- */
+#define PCM_Q_FRAMES  8   // 8 * 640B = 5120B RAM
+static int16_t pcm_q[PCM_Q_FRAMES][FRAME_SAMPLES];
+static volatile uint8_t pcm_q_w = 0;
+static volatile uint8_t pcm_q_r = 0;
+static volatile uint8_t pcm_q_count = 0;
+
+static int16_t scratch0[FRAME_SAMPLES];
+static int16_t scratch1[FRAME_SAMPLES];
+
+>>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 
 /* USER CODE END PV */
 
@@ -82,8 +103,46 @@ static void MX_DFSDM1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+
 #include <stdio.h>
 #include <string.h>
+
+static inline void pcm_q_push(const int16_t *frame)
+{
+  __disable_irq();
+  if (pcm_q_count < PCM_Q_FRAMES) {
+    memcpy(pcm_q[pcm_q_w], frame, FRAME_BYTES);
+    pcm_q_w = (pcm_q_w + 1) % PCM_Q_FRAMES;
+    pcm_q_count++;
+  }
+  // else: overflow -> drop newest frame (you can choose other policy)
+  __enable_irq();
+}
+
+static inline int pcm_q_pop(int16_t **frame_out)
+{
+  int ok = 0;
+  __disable_irq();
+  if (pcm_q_count > 0) {
+    *frame_out = pcm_q[pcm_q_r];
+    pcm_q_r = (pcm_q_r + 1) % PCM_Q_FRAMES;
+    pcm_q_count--;
+    ok = 1;
+  }
+  __enable_irq();
+  return ok;
+}
+
+static inline void usb_pump(void)
+{
+  if (usb_tx_busy) return;
+
+  int16_t *frame;
+  if (pcm_q_pop(&frame)) {
+    // This sets usb_tx_busy=1 inside CDC_Transmit_FS if TxState==0
+    (void)CDC_Transmit_FS((uint8_t*)frame, FRAME_BYTES);
+  }
+}
 
 int _write(int file, char *ptr, int len)
 {
@@ -93,7 +152,6 @@ int _write(int file, char *ptr, int len)
 
 uint32_t frame_count = 0;
 uint32_t last_tick = 0;
-
 
 /* USER CODE END 0 */
 
@@ -136,6 +194,7 @@ int main(void)
       dfsdm_dma,
       FRAME_SAMPLES * 2
   );
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -152,14 +211,23 @@ int main(void)
 	  do1 = half1_pending; half1_pending = 0;
 	  __enable_irq();
 
-	  if (do0 == 0 && do1 == 0) continue;
+	  if (do0 == 0 && do1 == 0) {
+	    usb_pump();
+	    continue;
+	  }
+
 
 	  // Drain in correct time order: half0 then half1
 	  while (do0 || do1) {
 
 	      if (do0) {
 	          int32_t *src = &dfsdm_dma[0];
+<<<<<<< HEAD
 	          int16_t *out = (pcm_buf_sel == 0) ? pcm_frame_a : pcm_frame_b;
+=======
+
+	          int16_t *out = scratch0;
+>>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 
 	          for (int i = 0; i < FRAME_SAMPLES; i++) {
 
@@ -177,6 +245,7 @@ int main(void)
 	              if (s < -32768) s = -32768;
 
 	              out[i] = (int16_t)s;
+<<<<<<< HEAD
 	          }
 
 //	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
@@ -189,13 +258,29 @@ int main(void)
 	        	    }
 	          }
 
+=======
+	          }
+
+//	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
+
+	          // Stream RAW PCM over USB CDC (non-blocking; drops frame if BUSY)
+	          // Stream RAW PCM over USB CDC (non-blocking; drops frame if BUSY)
+	          pcm_q_push(out);
+	          usb_pump();
+
+>>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 	          do0--;
 	          frame_count++;
 	      }
 
 	      if (do1) {
 	          int32_t *src = &dfsdm_dma[FRAME_SAMPLES];
+<<<<<<< HEAD
 	          int16_t *out = (pcm_buf_sel == 0) ? pcm_frame_a : pcm_frame_b;
+=======
+
+	          int16_t *out = scratch1;
+>>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 
 	          for (int i = 0; i < FRAME_SAMPLES; i++) {
 
@@ -213,6 +298,7 @@ int main(void)
 	              if (s < -32768) s = -32768;
 
 	              out[i] = (int16_t)s;
+<<<<<<< HEAD
 	          }
 
 //	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
@@ -224,6 +310,16 @@ int main(void)
 	        	    }
 	          }
 
+=======
+	          }
+
+//	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
+
+	          // Stream RAW PCM over USB CDC (non-blocking; drops frame if BUSY)
+	          pcm_q_push(out);
+	          usb_pump();
+
+>>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 	          do1--;
 	          frame_count++;
 	      }
@@ -232,9 +328,14 @@ int main(void)
 	  // 50 frames/sec check (now correct)
 	  uint32_t now = HAL_GetTick();
 	  if (now - last_tick >= 1000) {
+//		  printf("hello my friend \r\n");
 	      if (frame_count != 50) HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
 	      frame_count = 0;
 	      last_tick = now;
+//
+//	      static const char msg[] = "PING\n";
+//	      (void)CDC_Transmit_FS((uint8_t*)msg, sizeof(msg)-1);
+
 	  }
   }
   /* USER CODE END 3 */
@@ -329,7 +430,7 @@ static void MX_DFSDM1_Init(void)
   hdfsdm1_channel0.Instance = DFSDM1_Channel0;
   hdfsdm1_channel0.Init.OutputClock.Activation = ENABLE;
   hdfsdm1_channel0.Init.OutputClock.Selection = DFSDM_CHANNEL_OUTPUT_CLOCK_SYSTEM;
-  hdfsdm1_channel0.Init.OutputClock.Divider = 39;
+  hdfsdm1_channel0.Init.OutputClock.Divider = 5;
   hdfsdm1_channel0.Init.Input.Multiplexer = DFSDM_CHANNEL_EXTERNAL_INPUTS;
   hdfsdm1_channel0.Init.Input.DataPacking = DFSDM_CHANNEL_STANDARD_MODE;
   hdfsdm1_channel0.Init.Input.Pins = DFSDM_CHANNEL_SAME_CHANNEL_PINS;
