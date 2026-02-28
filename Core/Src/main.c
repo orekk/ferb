@@ -46,6 +46,8 @@ DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
 DFSDM_Channel_HandleTypeDef hdfsdm1_channel0;
 DMA_HandleTypeDef hdma_dfsdm1_flt0;
 
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -54,6 +56,15 @@ UART_HandleTypeDef huart2;
 #define FRAME_SAMPLES   (SAMPLE_RATE * FRAME_MS / 1000) // 320
 #define FRAME_BYTES     (FRAME_SAMPLES * 2)
 
+#define MAGIC0 0xA5
+#define MAGIC1 0x5A
+#define PCM_BYTES   FRAME_BYTES     // 640
+#define HDR_BYTES   6               // [A5 5A][uint16 fc][uint16 len]
+#define PKT_BYTES   (HDR_BYTES + PCM_BYTES)
+
+static uint16_t fc = 0;
+static uint8_t tx_pkt[PKT_BYTES];
+
 static int32_t dfsdm_dma[FRAME_SAMPLES * 2];
 
 volatile uint32_t half0_pending = 0;
@@ -61,13 +72,6 @@ volatile uint32_t half1_pending = 0;
 
 static int32_t dc = 0;
 
-<<<<<<< HEAD
-// USB audio double-buffer (so USB can transmit while we fill next frame)
-static int16_t pcm_frame_a[FRAME_SAMPLES];
-static int16_t pcm_frame_b[FRAME_SAMPLES];
-extern volatile uint8_t usb_tx_busy;
-static uint8_t pcm_buf_sel = 0; // 0 -> a, 1 -> b
-=======
 //// USB audio double-buffer (so USB can transmit while we fill next frame)
 //static int16_t pcm_frame_a[FRAME_SAMPLES];
 //static int16_t pcm_frame_b[FRAME_SAMPLES];
@@ -86,8 +90,6 @@ static volatile uint8_t pcm_q_count = 0;
 static int16_t scratch0[FRAME_SAMPLES];
 static int16_t scratch1[FRAME_SAMPLES];
 
->>>>>>> 24dc501 (Sending Audio via USB to Pi5)
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -96,6 +98,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_DFSDM1_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -106,6 +109,24 @@ static void MX_DFSDM1_Init(void);
 
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+uint32_t frame_count = 0;
+uint32_t last_tick = 0;
+
+static uint8_t servo_test_done = 0;
+
+typedef enum {
+  SERVO_HEAD = 0,
+  SERVO_ARM_L = 1,
+  SERVO_ARM_R = 2
+} servo_id_t;
+
+// ---- Tune these per servo/mechanics ----
+// MG995 typical: ~500-2500us, but safe range often ~1000-2000us.
+// Start conservative, widen only if you need more travel.
+#define SERVO_MIN_US  1000
+#define SERVO_MAX_US  2000
 
 static inline void pcm_q_push(const int16_t *frame)
 {
@@ -138,11 +159,23 @@ static inline void usb_pump(void)
   if (usb_tx_busy) return;
 
   int16_t *frame;
-  if (pcm_q_pop(&frame)) {
-    // This sets usb_tx_busy=1 inside CDC_Transmit_FS if TxState==0
-    (void)CDC_Transmit_FS((uint8_t*)frame, FRAME_BYTES);
+  if (!pcm_q_pop(&frame)) return;
+
+  // Build header
+  tx_pkt[0] = MAGIC0;
+  tx_pkt[1] = MAGIC1;
+  tx_pkt[2] = (uint8_t)(fc & 0xFF);
+  tx_pkt[3] = (uint8_t)(fc >> 8);
+  tx_pkt[4] = (uint8_t)(PCM_BYTES & 0xFF);
+  tx_pkt[5] = (uint8_t)(PCM_BYTES >> 8);
+
+  memcpy(&tx_pkt[HDR_BYTES], frame, PCM_BYTES);
+
+  if (CDC_Transmit_FS(tx_pkt, PKT_BYTES) == USBD_OK) {
+    fc++;
   }
 }
+
 
 int _write(int file, char *ptr, int len)
 {
@@ -150,8 +183,70 @@ int _write(int file, char *ptr, int len)
   return len;
 }
 
-uint32_t frame_count = 0;
-uint32_t last_tick = 0;
+
+// Channel mapping (your pins: PA6=CH1, PA7=CH2, PB0=CH3)
+static inline uint32_t servo_channel(servo_id_t id) {
+  switch (id) {
+    case SERVO_HEAD:  return TIM_CHANNEL_1;
+    case SERVO_ARM_L: return TIM_CHANNEL_2;
+    case SERVO_ARM_R: return TIM_CHANNEL_3;
+    default:          return TIM_CHANNEL_1;
+  }
+}
+
+static inline uint16_t clamp_u16(uint16_t x, uint16_t lo, uint16_t hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+static inline uint16_t angle_to_us(uint8_t deg_0_180) {
+  // Map 0..180 -> SERVO_MIN_US..SERVO_MAX_US
+  // integer math, rounded
+  uint32_t span = (uint32_t)(SERVO_MAX_US - SERVO_MIN_US);
+  uint32_t us = (uint32_t)SERVO_MIN_US + (span * (uint32_t)deg_0_180 + 90u) / 180u;
+  return (uint16_t)us;
+}
+
+// Low-level: set pulse width in microseconds (works b/c 1 tick = 1us)
+static inline void Servo_SetPulseUS(servo_id_t id, uint16_t us) {
+  us = clamp_u16(us, SERVO_MIN_US, SERVO_MAX_US);
+  __HAL_TIM_SET_COMPARE(&htim3, servo_channel(id), us);
+}
+
+// High-level: set angle 0..180 (clamped)
+void Servo_SetAngle(servo_id_t id, uint8_t deg) {
+  if (deg > 180) deg = 180;
+  Servo_SetPulseUS(id, angle_to_us(deg));
+}
+
+// Convenience wrappers
+static inline void Head_SetAngle(uint8_t deg)   { Servo_SetAngle(SERVO_HEAD, deg); }
+static inline void ArmL_SetAngle(uint8_t deg)   { Servo_SetAngle(SERVO_ARM_L, deg); }
+static inline void ArmR_SetAngle(uint8_t deg)   { Servo_SetAngle(SERVO_ARM_R, deg); }
+
+// Optional: smooth move (blocking). Call only when you *want* motion.
+// step_deg: 1–5 typical, step_ms: 10–30 typical.
+void Servo_MoveToBlocking(servo_id_t id, uint8_t from_deg, uint8_t to_deg,
+                          uint8_t step_deg, uint16_t step_ms)
+{
+  if (from_deg > 180) from_deg = 180;
+  if (to_deg > 180) to_deg = 180;
+  if (step_deg == 0) step_deg = 1;
+
+  if (to_deg >= from_deg) {
+    for (uint16_t d = from_deg; d <= to_deg; d += step_deg) {
+      Servo_SetAngle(id, (uint8_t)d);
+      HAL_Delay(step_ms);
+    }
+  } else {
+    for (int32_t d = (int32_t)from_deg; d >= (int32_t)to_deg; d -= (int32_t)step_deg) {
+      Servo_SetAngle(id, (uint8_t)d);
+      HAL_Delay(step_ms);
+    }
+  }
+  Servo_SetAngle(id, to_deg);
+}
 
 /* USER CODE END 0 */
 
@@ -188,12 +283,47 @@ int main(void)
   MX_USART2_UART_Init();
   MX_DFSDM1_Init();
   MX_USB_DEVICE_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_DFSDM_FilterRegularStart_DMA(
       &hdfsdm1_filter0,
       dfsdm_dma,
       FRAME_SAMPLES * 2
   );
+
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Head
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2); // Left arm
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3); // Right arm
+
+  if(!servo_test_done){
+  		  // --- SERVO SANITY TEST: run once then hold ---
+  		  	  // Start from neutral
+  		  	  Head_SetAngle(90);
+  		  	  ArmL_SetAngle(90);
+  		  	  ArmR_SetAngle(90);
+  		  	  HAL_Delay(800);
+
+  		  	  // Head sweep (small, safe)
+  		  	  Head_SetAngle(60);
+  		  	  HAL_Delay(800);
+  		  	  Head_SetAngle(120);
+  		  	  HAL_Delay(800);
+  		  	  Head_SetAngle(90);
+  		  	  HAL_Delay(800);
+
+  		  	  // Arms up/down
+  		  	  ArmL_SetAngle(40);
+  		  	  ArmR_SetAngle(40);
+  		  	  HAL_Delay(800);
+
+  		  	  ArmL_SetAngle(130);
+  		  	  ArmR_SetAngle(130);
+  		  	  HAL_Delay(800);
+
+  		  	  ArmL_SetAngle(90);
+  		  	  ArmR_SetAngle(90);
+  		  	  HAL_Delay(800);
+  	  }
 
   /* USER CODE END 2 */
 
@@ -222,19 +352,14 @@ int main(void)
 
 	      if (do0) {
 	          int32_t *src = &dfsdm_dma[0];
-<<<<<<< HEAD
-	          int16_t *out = (pcm_buf_sel == 0) ? pcm_frame_a : pcm_frame_b;
-=======
-
 	          int16_t *out = scratch0;
->>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 
 	          for (int i = 0; i < FRAME_SAMPLES; i++) {
 
 	              int32_t s = src[i] >> 15;        // DFSDM -> approx int16 range
 
 	              // remove DC (high-pass)
-	              dc += (s - dc) >> 8;
+	              dc += (s - dc) >> 6;
 	              s = s - dc;
 
 	              // OPTIONAL small gain (comment this out if too loud)
@@ -245,20 +370,6 @@ int main(void)
 	              if (s < -32768) s = -32768;
 
 	              out[i] = (int16_t)s;
-<<<<<<< HEAD
-	          }
-
-//	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
-
-	          // Stream RAW PCM over USB CDC (non-blocking; drops frame if BUSY)
-	          if (!usb_tx_busy) {
-	        	    if (CDC_Transmit_FS((uint8_t*)out, FRAME_BYTES) == USBD_OK) {
-	        	        usb_tx_busy = 1;      // only mark busy if TX actually started
-	        	        pcm_buf_sel ^= 1;     // flip buffer only if TX started
-	        	    }
-	          }
-
-=======
 	          }
 
 //	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
@@ -267,27 +378,21 @@ int main(void)
 	          // Stream RAW PCM over USB CDC (non-blocking; drops frame if BUSY)
 	          pcm_q_push(out);
 	          usb_pump();
-
->>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 	          do0--;
 	          frame_count++;
 	      }
 
 	      if (do1) {
 	          int32_t *src = &dfsdm_dma[FRAME_SAMPLES];
-<<<<<<< HEAD
-	          int16_t *out = (pcm_buf_sel == 0) ? pcm_frame_a : pcm_frame_b;
-=======
 
 	          int16_t *out = scratch1;
->>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 
 	          for (int i = 0; i < FRAME_SAMPLES; i++) {
 
 	              int32_t s = src[i] >> 15;        // DFSDM -> approx int16 range
 
 	              // remove DC (high-pass)
-	              dc += (s - dc) >> 8;
+	              dc += (s - dc) >> 6;
 	              s = s - dc;
 
 	              // OPTIONAL small gain (comment this out if too loud)
@@ -298,19 +403,6 @@ int main(void)
 	              if (s < -32768) s = -32768;
 
 	              out[i] = (int16_t)s;
-<<<<<<< HEAD
-	          }
-
-//	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
-
-	          if (!usb_tx_busy) {
-	        	    if (CDC_Transmit_FS((uint8_t*)out, FRAME_BYTES) == USBD_OK) {
-	        	        usb_tx_busy = 1;      // only mark busy if TX actually started
-	        	        pcm_buf_sel ^= 1;     // flip buffer only if TX started
-	        	    }
-	          }
-
-=======
 	          }
 
 //	          HAL_UART_Transmit(&huart2, (uint8_t*)pcm_frame, FRAME_BYTES, HAL_MAX_DELAY);// FOR UART TRANSMISSION
@@ -319,7 +411,6 @@ int main(void)
 	          pcm_q_push(out);
 	          usb_pump();
 
->>>>>>> 24dc501 (Sending Audio via USB to Pi5)
 	          do1--;
 	          frame_count++;
 	      }
@@ -337,6 +428,7 @@ int main(void)
 //	      (void)CDC_Transmit_FS((uint8_t*)msg, sizeof(msg)-1);
 
 	  }
+
   }
   /* USER CODE END 3 */
 }
@@ -452,6 +544,63 @@ static void MX_DFSDM1_Init(void)
 
 
   /* USER CODE END DFSDM1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 79;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
 
 }
 
